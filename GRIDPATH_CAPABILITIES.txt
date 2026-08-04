@@ -1,0 +1,21 @@
+GRIDPATH — SITE SELECTION WORKSPACE
+
+What it is
+GridPath is a browser-based early-stage site screening workspace for infrastructure and industrial projects. It helps a team bring a project brief, choose a real location, set practical constraints, and compare candidate areas on a map.
+
+What it can do
+- Search cities, states, countries, and exact latitude/longitude coordinates.
+- Show likely location matches before changing the selected location.
+- Open any suggested location in Google Maps using its exact coordinates.
+- Accept a Markdown, text, or PowerPoint project brief and extract basic project assumptions in the browser.
+- Screen multiple project types, including solar, storage, wind, transmission, data centres, hydrogen, industrial projects, geothermal, and nuclear projects.
+- Adjust capacity, land area, budget, grid need, water need, schedule, risk tolerance, and decision priority.
+- Draw a boundary on the map to keep candidate suggestions within a user-defined area.
+- Rank candidate areas using weighted grid, environmental, permitting, land-fit, and economic screening signals.
+- Retrieve live weather and elevation for the selected location.
+- Run an on-demand public-map check for nearby mapped power and transport features.
+- Provide a jurisdiction-aware legal, land, and price review checklist for the top three candidates.
+- Let users use plain text in the project assistant to update common project parameters.
+
+Important limitations
+GridPath is a decision-support screen, not a permit, legal opinion, title search, land valuation, engineering survey, transmission-capacity study, or environmental clearance. Public map data can be incomplete. Every shortlisted location must be confirmed with the relevant utility, planning authority, land registry, landowner, engineering team, and legal counsel.
