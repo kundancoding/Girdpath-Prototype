@@ -103,6 +103,13 @@ async function findCandidateLeads(url: URL): Promise<Response> {
   if (!point) return jsonResponse({ candidates: [], message: "A valid latitude and longitude are required." }, 60);
   try {
     const radius = scopeRadii[scope];
+    // This provider is responsive from the Worker and returns real OSM feature records.
+    // Put it first so the interface does not wait on a slow parcel-tag query.
+    const photonLeads = await photonCandidateLeads(point, radius, project, locationHint);
+    if (photonLeads.length) {
+      const nearby = photonLeads.slice(0, 12).map(({ distance: _distance, score: _score, ...candidate }) => candidate);
+      return jsonResponse({ candidates: nearby, source: "OpenStreetMap Photon local-feature discovery", cappedRadiusM: radius }, 300);
+    }
     const query = `[out:json][timeout:18];(way(around:${radius},${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland|construction|quarry)$"];nwr(around:${radius},${point.lat},${point.lng})["power"~"^(substation|plant|generator)$"];);out center 160;`;
     let elements: OsmElement[] = [];
     // Some regions have little parcel tagging. A named OSM locality is still a real,
@@ -126,11 +133,7 @@ async function findCandidateLeads(url: URL): Promise<Response> {
       candidates.push({ id: candidate.id, lat: candidate.lat, lng: candidate.lng, name: candidate.name, landUse: candidate.landUse, source: candidate.source });
       if (candidates.length === 12) break;
     }
-    if (!candidates.length) {
-      const photonLeads = await photonCandidateLeads(point, radius, project, locationHint);
-      const nearby = photonLeads.slice(0, 12).map(({ distance: _distance, score: _score, ...candidate }) => candidate);
-      return jsonResponse({ candidates: nearby, source: nearby.length ? "OpenStreetMap Photon matched features (Overpass was unavailable)" : "Public OpenStreetMap discovery", cappedRadiusM: radius, message: nearby.length ? undefined : "Neither public map provider returned a usable local feature for this area." }, 300);
-    }
+    if (!candidates.length) return jsonResponse({ candidates: [], source: "Public OpenStreetMap discovery", cappedRadiusM: radius, message: "Neither public map provider returned a usable local feature for this area." }, 300);
     return jsonResponse({ candidates, source: localityFallback ? "OpenStreetMap named locality fallback (no mapped land/power lead was available)" : "OpenStreetMap mapped land-use and power leads", cappedRadiusM: radius }, 300);
   } catch {
     return jsonResponse({ candidates: [], message: "Mapped-area discovery is temporarily unavailable." }, 60);
