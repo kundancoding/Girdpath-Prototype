@@ -1,9 +1,9 @@
-/** Cloudflare Worker entry point for the vinext-starter template. */
+/** Cloudflare Worker entry point for the GridPath public-data model. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 
 const securityHeaders = {
-  "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https://*.tile.openstreetmap.org https://*.arcgisonline.com; connect-src 'self' https://api.open-meteo.com https://geocoding-api.open-meteo.com https://api.bigdatacloud.net https://www.federalregister.gov https://overpass-api.de https://photon.komoot.io; frame-src https://www.openstreetmap.org; upgrade-insecure-requests",
+  "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https://*.tile.openstreetmap.org https://*.arcgisonline.com; connect-src 'self' https://api.open-meteo.com https://air-quality-api.open-meteo.com https://geocoding-api.open-meteo.com https://api.bigdatacloud.net https://www.federalregister.gov https://overpass-api.de https://photon.komoot.io; frame-src https://www.openstreetmap.org; upgrade-insecure-requests",
   "Permissions-Policy": "geolocation=(self), camera=(), microphone=(), payment=(), usb=()",
   "Referrer-Policy": "strict-origin-when-cross-origin",
   "X-Content-Type-Options": "nosniff",
@@ -19,103 +19,133 @@ function secure(response: Response) {
 type LocationResult = { id: number; name: string; latitude: number; longitude: number; admin1?: string; country?: string; country_code?: string };
 type Scope = "local" | "city" | "regional" | "state" | "country";
 type OsmElement = { id?: number; type?: string; lat?: number; lon?: number; center?: { lat?: number; lon?: number }; tags?: Record<string, string | undefined> };
+type Point = { lat: number; lng: number };
 
-const scopeRadii: Record<Scope, number> = { local: 8000, city: 28000, regional: 65000, state: 120000, country: 180000 };
-
-function locationResponse(results: LocationResult[]) {
-  return new Response(JSON.stringify({ results }), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" } });
-}
+const scopeRadii: Record<Scope, number> = { local: 12000, city: 50000, regional: 110000, state: 180000, country: 240000 };
+const landUses = new Set(["industrial", "brownfield", "commercial", "farmland", "construction", "quarry"]);
 
 function jsonResponse(data: unknown, maxAge = 300) {
   return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": `public, max-age=${maxAge}` } });
 }
-
-function parsePoint(url: URL): { lat: number; lng: number } | null {
+function locationResponse(results: LocationResult[]) { return jsonResponse({ results }, 300); }
+function parsePoint(url: URL): Point | null {
   const lat = Number(url.searchParams.get("lat"));
   const lng = Number(url.searchParams.get("lng"));
   return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : null;
 }
-
-function pointFrom(element: OsmElement) {
+function pointFrom(element: OsmElement): Point | null {
   const lat = element.lat ?? element.center?.lat;
   const lng = element.lon ?? element.center?.lon;
   return Number.isFinite(lat) && Number.isFinite(lng) ? { lat: Number(lat), lng: Number(lng) } : null;
 }
-
+function distanceKm(a: Point, b: Point) {
+  const r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r;
+  const dLng = (b.lng - a.lng) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
+  return 12742 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
 async function overpass(query: string): Promise<OsmElement[]> {
   const response = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
   if (!response.ok) throw new Error(`Public map service returned ${response.status}`);
   const data = await response.json() as { elements?: OsmElement[] };
   return Array.isArray(data.elements) ? data.elements : [];
 }
+function requestedScope(value: string | null): Scope { return value === "local" || value === "city" || value === "regional" || value === "state" || value === "country" ? value : "city"; }
+function useScore(tags: Record<string, string | undefined>, project: string) {
+  const land = tags.landuse || "";
+  const lower = project.toLowerCase();
+  let score = land === "brownfield" ? 8 : land === "industrial" ? 7 : land === "construction" ? 6 : land === "commercial" ? 5 : land === "farmland" ? 4 : land === "quarry" ? 3 : 2;
+  if (lower.includes("data center") && ["industrial", "brownfield", "commercial"].includes(land)) score += 5;
+  if ((lower.includes("solar") || lower.includes("wind")) && ["farmland", "brownfield", "quarry"].includes(land)) score += 5;
+  if (lower.includes("transmission") && tags.power) score += 6;
+  if (lower.includes("nuclear") && ["industrial", "brownfield"].includes(land)) score += 4;
+  if (tags.name) score += 1;
+  return score;
+}
 
 async function findCandidateLeads(url: URL): Promise<Response> {
   const point = parsePoint(url);
-  const requestedScope = url.searchParams.get("scope");
-  const scope: Scope = requestedScope === "local" || requestedScope === "city" || requestedScope === "regional" || requestedScope === "state" || requestedScope === "country" ? requestedScope : "city";
+  const scope = requestedScope(url.searchParams.get("scope"));
+  const project = (url.searchParams.get("project") || "").slice(0, 80);
   if (!point) return jsonResponse({ candidates: [], message: "A valid latitude and longitude are required." }, 60);
   try {
-    // These are map leads, not parcel ownership records. The radius is deliberately capped
-    // to keep a public Overpass query responsive even when a country-wide lens is selected.
-    const query = `[out:json][timeout:14];way(around:${scopeRadii[scope]},${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland)$"];out center 80;`;
+    const radius = scopeRadii[scope];
+    const query = `[out:json][timeout:18];(way(around:${radius},${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland|construction|quarry)$"];nwr(around:${radius},${point.lat},${point.lng})["power"~"^(substation|plant|generator)$"];);out center 160;`;
     const elements = await overpass(query);
-    const buckets = new Map<number, { id: string; lat: number; lng: number; name: string; landUse: string; source: "mapped"; distance: number }>();
-    for (const element of elements) {
-      const center = pointFrom(element);
-      if (!center || !element.id) continue;
-      const north = center.lat - point.lat;
-      const east = (center.lng - point.lng) * Math.cos(point.lat * Math.PI / 180);
-      const distance = Math.hypot(north, east);
-      if (distance < 0.002) continue;
-      const bearing = (Math.atan2(east, north) + Math.PI * 2) % (Math.PI * 2);
-      const bucket = Math.floor(bearing / (Math.PI / 4));
-      const tags = element.tags ?? {};
-      const landUse = tags.landuse || "mapped land";
-      const candidate = { id: `osm-${element.type || "way"}-${element.id}`, lat: center.lat, lng: center.lng, name: tags.name || `Mapped ${landUse}`, landUse, source: "mapped" as const, distance };
-      const previous = buckets.get(bucket);
-      if (!previous || candidate.distance < previous.distance) buckets.set(bucket, candidate);
+    const pool = elements.flatMap((element) => {
+      const center = pointFrom(element); const tags = element.tags ?? {};
+      if (!center || !element.id || (!landUses.has(tags.landuse || "") && !tags.power)) return [];
+      const distance = distanceKm(point, center);
+      if (distance < .15) return [];
+      const landUse = tags.landuse || (tags.power ? `power ${tags.power}` : "mapped land");
+      return [{ id: `osm-${element.type || "way"}-${element.id}`, lat: center.lat, lng: center.lng, name: tags.name || tags["addr:city"] || tags["addr:suburb"] || `Mapped ${landUse}`, landUse, source: "mapped" as const, distance, score: useScore(tags, project) }];
+    }).sort((a, b) => b.score - a.score || a.distance - b.distance);
+    // Select mapped features, not a compass pattern. Separation only prevents duplicate pins on one parcel.
+    const minimumSeparation = Math.max(.7, radius / 1000 / 16);
+    const candidates: Array<{ id: string; lat: number; lng: number; name: string; landUse: string; source: "mapped" }> = [];
+    for (const candidate of pool) {
+      if (candidates.some((picked) => distanceKm(picked, candidate) < minimumSeparation)) continue;
+      candidates.push({ id: candidate.id, lat: candidate.lat, lng: candidate.lng, name: candidate.name, landUse: candidate.landUse, source: candidate.source });
+      if (candidates.length === 12) break;
     }
-    const candidates = [...buckets.values()].sort((a, b) => a.distance - b.distance).slice(0, 8).map(({ distance: _distance, ...candidate }) => candidate);
-    return jsonResponse({ candidates, source: "OpenStreetMap mapped land-use leads", cappedRadiusM: scopeRadii[scope] }, 300);
+    return jsonResponse({ candidates, source: "OpenStreetMap mapped land-use and power leads", cappedRadiusM: radius }, 300);
   } catch {
     return jsonResponse({ candidates: [], message: "Mapped-area discovery is temporarily unavailable." }, 60);
   }
 }
 
+function average(values: unknown) {
+  const numbers = Array.isArray(values) ? values.filter((value): value is number => typeof value === "number" && Number.isFinite(value)) : [];
+  return numbers.length ? numbers.reduce((sum, value) => sum + value, 0) / numbers.length : null;
+}
+function maximum(values: unknown) {
+  const numbers = Array.isArray(values) ? values.filter((value): value is number => typeof value === "number" && Number.isFinite(value)) : [];
+  return numbers.length ? Math.max(...numbers) : null;
+}
+
 async function candidateEvidence(url: URL): Promise<Response> {
   const point = parsePoint(url);
   if (!point) return jsonResponse({ error: "A valid latitude and longitude are required." }, 60);
-  try {
-    const query = `[out:json][timeout:14];(nwr(around:5000,${point.lat},${point.lng})["power"~"^(substation|plant|generator)$"];way(around:5000,${point.lat},${point.lng})["highway"~"^(motorway|trunk|primary)$"];way(around:5000,${point.lat},${point.lng})["railway"~"^(rail|light_rail)$"];nwr(around:5000,${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland)$"];nwr(around:5000,${point.lat},${point.lng})["boundary"="protected_area"];nwr(around:5000,${point.lat},${point.lng})["leisure"="nature_reserve"];nwr(around:5000,${point.lat},${point.lng})["natural"="wetland"];);out center;`;
-    const [elements, weatherResponse] = await Promise.all([
-      overpass(query),
-      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${point.lat}&longitude=${point.lng}&timezone=auto&current=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation`),
-    ]);
-    const weatherData = weatherResponse.ok ? await weatherResponse.json() as { elevation?: number; current?: { temperature_2m?: number; wind_speed_10m?: number; wind_gusts_10m?: number; precipitation?: number; time?: string } } : {};
-    let power = 0; let transport = 0; let mappedLand = 0; let protectedAreas = 0; let wetlands = 0;
-    for (const element of elements) {
-      const tags = element.tags ?? {};
-      if (tags.power) power += 1;
-      if (tags.highway || tags.railway) transport += 1;
-      if (tags.landuse) mappedLand += 1;
-      if (tags.boundary === "protected_area" || tags.leisure === "nature_reserve") protectedAreas += 1;
-      if (tags.natural === "wetland") wetlands += 1;
-    }
-    const current = weatherData.current;
-    return jsonResponse({
-      checked: true,
-      power: Math.min(power, 99),
-      transport: Math.min(transport, 99),
-      mappedLand: Math.min(mappedLand, 99),
-      protectedAreas: Math.min(protectedAreas, 99),
-      wetlands: Math.min(wetlands, 99),
-      elevation: Number.isFinite(weatherData.elevation) ? Math.round(Number(weatherData.elevation)) : null,
-      weather: current ? { temperature: Number(current.temperature_2m ?? 0), wind: Number(current.wind_speed_10m ?? 0), gusts: Number(current.wind_gusts_10m ?? 0), precipitation: Number(current.precipitation ?? 0), updated: String(current.time ?? "") } : null,
-      sources: ["OpenStreetMap / Overpass (5 km screen)", "Open-Meteo (current weather and elevation)"],
-    }, 600);
-  } catch {
-    return jsonResponse({ error: "Public evidence is temporarily unavailable." }, 60);
+  const query = `[out:json][timeout:16];(nwr(around:5000,${point.lat},${point.lng})["power"="substation"];nwr(around:5000,${point.lat},${point.lng})["power"="plant"];nwr(around:5000,${point.lat},${point.lng})["power"="generator"];way(around:5000,${point.lat},${point.lng})["power"~"^(line|minor_line)$"];node(around:5000,${point.lat},${point.lng})["power"~"^(tower|pole)$"];way(around:5000,${point.lat},${point.lng})["highway"~"^(motorway|trunk|primary)$"];way(around:5000,${point.lat},${point.lng})["railway"~"^(rail|light_rail)$"];nwr(around:5000,${point.lat},${point.lng})["aeroway"~"^(aerodrome|helipad)$"];nwr(around:5000,${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland|construction|quarry)$"];nwr(around:5000,${point.lat},${point.lng})["building"];nwr(around:5000,${point.lat},${point.lng})["boundary"="protected_area"];nwr(around:5000,${point.lat},${point.lng})["leisure"="nature_reserve"];nwr(around:5000,${point.lat},${point.lng})["natural"~"^(wetland|water|wood)$"];nwr(around:5000,${point.lat},${point.lng})["landuse"="forest"];way(around:5000,${point.lat},${point.lng})["waterway"~"^(river|stream|canal)$"];);out center 400;`;
+  const forecastUrl = `https://api.open-meteo.com/v1/forecast?latitude=${point.lat}&longitude=${point.lng}&timezone=auto&forecast_days=7&current=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,shortwave_radiation_sum,sunshine_duration,et0_fao_evapotranspiration`;
+  const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${point.lat}&longitude=${point.lng}&current=us_aqi,pm2_5,pm10,nitrogen_dioxide,ozone,dust`;
+  const [mapResult, forecastResult, airResult] = await Promise.allSettled([overpass(query), fetch(forecastUrl), fetch(airUrl)]);
+  if (mapResult.status !== "fulfilled" && forecastResult.status !== "fulfilled" && airResult.status !== "fulfilled") return jsonResponse({ error: "Public evidence is temporarily unavailable." }, 60);
+  const elements = mapResult.status === "fulfilled" ? mapResult.value : [];
+  const forecast = forecastResult.status === "fulfilled" && forecastResult.value.ok ? await forecastResult.value.json() as { elevation?: number; current?: Record<string, unknown>; daily?: Record<string, unknown> } : {};
+  const air = airResult.status === "fulfilled" && airResult.value.ok ? await airResult.value.json() as { current?: Record<string, unknown> } : {};
+  const count = { substations: 0, plants: 0, generators: 0, powerLines: 0, towers: 0, primaryRoads: 0, railways: 0, airports: 0, industrial: 0, brownfield: 0, commercial: 0, farmland: 0, construction: 0, quarry: 0, buildings: 0, protectedAreas: 0, natureReserves: 0, wetlands: 0, water: 0, waterways: 0, forests: 0 };
+  for (const element of elements) {
+    const tags = element.tags ?? {};
+    if (tags.power === "substation") count.substations += 1;
+    if (tags.power === "plant") count.plants += 1;
+    if (tags.power === "generator") count.generators += 1;
+    if (tags.power === "line" || tags.power === "minor_line") count.powerLines += 1;
+    if (tags.power === "tower" || tags.power === "pole") count.towers += 1;
+    if (tags.highway) count.primaryRoads += 1;
+    if (tags.railway) count.railways += 1;
+    if (tags.aeroway) count.airports += 1;
+    if (tags.landuse === "industrial") count.industrial += 1;
+    if (tags.landuse === "brownfield") count.brownfield += 1;
+    if (tags.landuse === "commercial") count.commercial += 1;
+    if (tags.landuse === "farmland") count.farmland += 1;
+    if (tags.landuse === "construction") count.construction += 1;
+    if (tags.landuse === "quarry") count.quarry += 1;
+    if (tags.building) count.buildings += 1;
+    if (tags.boundary === "protected_area") count.protectedAreas += 1;
+    if (tags.leisure === "nature_reserve") count.natureReserves += 1;
+    if (tags.natural === "wetland") count.wetlands += 1;
+    if (tags.natural === "water") count.water += 1;
+    if (tags.waterway) count.waterways += 1;
+    if (tags.natural === "wood" || tags.landuse === "forest") count.forests += 1;
   }
+  const current = forecast.current ?? {}; const daily = forecast.daily ?? {}; const airCurrent = air.current ?? {};
+  const weather = typeof current.temperature_2m === "number" ? { temperature: current.temperature_2m, wind: Number(current.wind_speed_10m ?? 0), gusts: Number(current.wind_gusts_10m ?? 0), precipitation: Number(current.precipitation ?? 0), updated: String(current.time ?? "") } : null;
+  const climate = { maxTemperature: maximum(daily.temperature_2m_max), minTemperature: average(daily.temperature_2m_min), precipitation7d: average(daily.precipitation_sum) === null ? null : (daily.precipitation_sum as number[]).filter((value) => typeof value === "number").reduce((sum, value) => sum + value, 0), maxWind: maximum(daily.wind_speed_10m_max), maxGust: maximum(daily.wind_gusts_10m_max), radiation: average(daily.shortwave_radiation_sum), sunshineHours: average(daily.sunshine_duration) === null ? null : average(daily.sunshine_duration)! / 3600, evapotranspiration: average(daily.et0_fao_evapotranspiration) };
+  const airQuality = { usAqi: typeof airCurrent.us_aqi === "number" ? airCurrent.us_aqi : null, pm25: typeof airCurrent.pm2_5 === "number" ? airCurrent.pm2_5 : null, pm10: typeof airCurrent.pm10 === "number" ? airCurrent.pm10 : null, nitrogenDioxide: typeof airCurrent.nitrogen_dioxide === "number" ? airCurrent.nitrogen_dioxide : null, ozone: typeof airCurrent.ozone === "number" ? airCurrent.ozone : null, dust: typeof airCurrent.dust === "number" ? airCurrent.dust : null };
+  const coverage = [mapResult.status === "fulfilled", Boolean(weather), climate.radiation !== null, airQuality.usAqi !== null].filter(Boolean).length;
+  return jsonResponse({ checked: coverage > 0, coverage, features: count, elevation: Number.isFinite(forecast.elevation) ? Math.round(Number(forecast.elevation)) : null, weather, climate, airQuality, sources: ["OpenStreetMap / Overpass (5 km mapped-feature screen)", "Open-Meteo (current and seven-day operational-weather screen)", "Open-Meteo / CAMS air-quality forecast"] }, 600);
 }
 
 async function findLocations(query: string): Promise<Response> {
@@ -123,12 +153,9 @@ async function findLocations(query: string): Promise<Response> {
   try {
     const photonResponse = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=5`);
     const photon = photonResponse.ok ? await photonResponse.json() as { features?: Array<{ geometry?: { coordinates?: number[] }; properties?: Record<string, string | number | undefined> }> } : {};
-    const photonResults = (photon.features ?? []).map((feature, index) => {
-      const properties = feature.properties ?? {};
-      return { id: Number(properties.osm_id) || index + 1, name: String(properties.name || properties.city || properties.state || query), latitude: Number(feature.geometry?.coordinates?.[1]), longitude: Number(feature.geometry?.coordinates?.[0]), admin1: String(properties.state || properties.county || properties.city || "") || undefined, country: String(properties.country || "") || undefined, country_code: String(properties.countrycode || "") || undefined };
-    }).filter((item) => Number.isFinite(item.latitude) && Number.isFinite(item.longitude));
-    if (photonResults.length) return locationResponse(photonResults);
-  } catch { /* Try the secondary provider below. */ }
+    const results = (photon.features ?? []).map((feature, index) => { const properties = feature.properties ?? {}; return { id: Number(properties.osm_id) || index + 1, name: String(properties.name || properties.city || properties.state || query), latitude: Number(feature.geometry?.coordinates?.[1]), longitude: Number(feature.geometry?.coordinates?.[0]), admin1: String(properties.state || properties.county || properties.city || "") || undefined, country: String(properties.country || "") || undefined, country_code: String(properties.countrycode || "") || undefined }; }).filter((item) => Number.isFinite(item.latitude) && Number.isFinite(item.longitude));
+    if (results.length) return locationResponse(results);
+  } catch { /* Use the secondary provider. */ }
   try {
     const response = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=5&language=en&format=json`);
     const data = response.ok ? await response.json() as { results?: Array<{ id?: number; name?: string; latitude?: number; longitude?: number; admin1?: string; country?: string; country_code?: string }> } : {};
@@ -136,48 +163,19 @@ async function findLocations(query: string): Promise<Response> {
   } catch { return locationResponse([]); }
 }
 
-interface Env {
-  ASSETS: Fetcher;
-  DB: D1Database;
-  IMAGES: {
-    input(stream: ReadableStream): {
-      transform(options: Record<string, unknown>): {
-        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
-      };
-    };
-  };
-}
-
-interface ExecutionContext {
-  waitUntil(promise: Promise<unknown>): void;
-  passThroughOnException(): void;
-}
-
-// Image security config. SVG sources with .svg extension auto-skip the
-// optimization endpoint on the client side (served directly, no proxy).
-// To route SVGs through the optimizer (with security headers), set
-// dangerouslyAllowSVG: true in next.config.js and uncomment below:
-// const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
+interface Env { ASSETS: Fetcher; DB: D1Database; IMAGES: { input(stream: ReadableStream): { transform(options: Record<string, unknown>): { output(options: { format: string; quality: number }): Promise<{ response(): Response }> } } } }
+interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-
     if (url.pathname === "/api/location-search") return secure(await findLocations(url.searchParams.get("q")?.trim() ?? ""));
     if (url.pathname === "/api/candidate-search") return secure(await findCandidateLeads(url));
     if (url.pathname === "/api/candidate-evidence") return secure(await candidateEvidence(url));
-
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-      return secure(await handleImageOptimization(request, {
-        fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))),
-        transformImage: async (body, { width, format, quality }) => {
-          const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality });
-          return result.response();
-        },
-      }, allowedWidths));
+      return secure(await handleImageOptimization(request, { fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))), transformImage: async (body, { width, format, quality }) => (await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality })).response() }, allowedWidths));
     }
-
     return secure(await handler.fetch(request, env, ctx));
   },
 };
