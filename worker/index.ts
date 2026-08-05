@@ -77,7 +77,9 @@ async function photonCandidateLeads(point: Point, radius: number, project: strin
   const place = locationHint.trim() || "local";
   const projectWords = project.replace(/[^a-z0-9 ]/gi, " ").trim();
   const queries = [...new Set([`${place} ${projectWords}`, `${place} substation`, `${place} industrial`, `${place} commercial`])].slice(0, 4);
-  const responses = await Promise.allSettled(queries.map((query) => fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&lat=${point.lat}&lon=${point.lng}&limit=10`)));
+  // Keep this request shape aligned with the tested location search route. The place
+  // name anchors the results; distance filtering below keeps only local features.
+  const responses = await Promise.allSettled(queries.map((query) => fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=10`)));
   const seen = new Set<string>(); const pool: MappedCandidate[] = [];
   for (const response of responses) {
     if (response.status !== "fulfilled" || !response.value.ok) continue;
