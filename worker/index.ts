@@ -72,14 +72,22 @@ async function findCandidateLeads(url: URL): Promise<Response> {
   try {
     const radius = scopeRadii[scope];
     const query = `[out:json][timeout:18];(way(around:${radius},${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland|construction|quarry)$"];nwr(around:${radius},${point.lat},${point.lng})["power"~"^(substation|plant|generator)$"];);out center 160;`;
-    const elements = await overpass(query);
+    let elements = await overpass(query);
+    // Some regions have little parcel tagging. A named OSM locality is still a real,
+    // clickable geographic lead; use it only when there are no mapped land/power features.
+    let localityFallback = false;
+    if (!elements.length) {
+      localityFallback = true;
+      elements = await overpass(`[out:json][timeout:18];nwr(around:${radius},${point.lat},${point.lng})["place"~"^(city|town|village|suburb)$"];out center 100;`);
+    }
     const pool = elements.flatMap((element) => {
       const center = pointFrom(element); const tags = element.tags ?? {};
-      if (!center || !element.id || (!landUses.has(tags.landuse || "") && !tags.power)) return [];
+      const isLocality = localityFallback && Boolean(tags.place);
+      if (!center || !element.id || (!landUses.has(tags.landuse || "") && !tags.power && !isLocality)) return [];
       const distance = distanceKm(point, center);
       if (distance < .15) return [];
-      const landUse = tags.landuse || (tags.power ? `power ${tags.power}` : "mapped land");
-      return [{ id: `osm-${element.type || "way"}-${element.id}`, lat: center.lat, lng: center.lng, name: tags.name || tags["addr:city"] || tags["addr:suburb"] || `Mapped ${landUse}`, landUse, source: "mapped" as const, distance, score: useScore(tags, project) }];
+      const landUse = isLocality ? `nearby ${tags.place} area` : tags.landuse || (tags.power ? `power ${tags.power}` : "mapped land");
+      return [{ id: `osm-${element.type || "way"}-${element.id}`, lat: center.lat, lng: center.lng, name: tags.name || tags["name:en"] || tags["addr:city"] || tags["addr:suburb"] || `Nearby ${tags.place || landUse}`, landUse, source: "mapped" as const, distance, score: isLocality ? 1 : useScore(tags, project) }];
     }).sort((a, b) => b.score - a.score || a.distance - b.distance);
     // Select mapped features, not a compass pattern. Separation only prevents duplicate pins on one parcel.
     const minimumSeparation = Math.max(.7, radius / 1000 / 16);
@@ -89,7 +97,7 @@ async function findCandidateLeads(url: URL): Promise<Response> {
       candidates.push({ id: candidate.id, lat: candidate.lat, lng: candidate.lng, name: candidate.name, landUse: candidate.landUse, source: candidate.source });
       if (candidates.length === 12) break;
     }
-    return jsonResponse({ candidates, source: "OpenStreetMap mapped land-use and power leads", cappedRadiusM: radius }, 300);
+    return jsonResponse({ candidates, source: localityFallback ? "OpenStreetMap named locality fallback (no mapped land/power lead was available)" : "OpenStreetMap mapped land-use and power leads", cappedRadiusM: radius, message: candidates.length ? undefined : "The public map query completed but did not return a usable mapped feature for this area." }, 300);
   } catch {
     return jsonResponse({ candidates: [], message: "Mapped-area discovery is temporarily unavailable." }, 60);
   }
