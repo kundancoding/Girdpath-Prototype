@@ -148,6 +148,39 @@ async function candidateEvidence(url: URL): Promise<Response> {
   return jsonResponse({ checked: coverage > 0, coverage, features: count, elevation: Number.isFinite(forecast.elevation) ? Math.round(Number(forecast.elevation)) : null, weather, climate, airQuality, sources: ["OpenStreetMap / Overpass (5 km mapped-feature screen)", "Open-Meteo (current and seven-day operational-weather screen)", "Open-Meteo / CAMS air-quality forecast"] }, 600);
 }
 
+function legalTerms(project: string) {
+  const lower = project.toLowerCase();
+  if (lower.includes("nuclear")) return "nuclear power plant environmental permitting";
+  if (lower.includes("transmission")) return "electric transmission right of way permitting";
+  if (lower.includes("wind")) return "wind energy environmental permitting";
+  if (lower.includes("solar")) return "solar energy environmental permitting";
+  if (lower.includes("data center")) return "data center energy environmental permitting";
+  return "energy infrastructure environmental permitting";
+}
+
+async function legalResearch(url: URL): Promise<Response> {
+  const country = (url.searchParams.get("country") || "").toUpperCase();
+  const term = legalTerms((url.searchParams.get("project") || "").slice(0, 80));
+  if (country !== "US") return jsonResponse({ available: false, jurisdiction: country || "Unresolved", notices: [], cases: [], message: "No universal authoritative legal or court database is connected for this jurisdiction. Add the relevant official registry before making a legal assessment." }, 300);
+  const federalUrl = `https://www.federalregister.gov/api/v1/documents.json?conditions[term]=${encodeURIComponent(term)}&per_page=8&order=newest`;
+  const courtUrl = `https://www.courtlistener.com/api/rest/v4/search/?q=${encodeURIComponent(term)}&type=o&order_by=dateFiled%20desc`;
+  const [federalResult, courtResult] = await Promise.allSettled([fetch(federalUrl), fetch(courtUrl)]);
+  const notices: Array<{ title: string; date?: string; agency?: string; url: string }> = [];
+  const cases: Array<{ title: string; date?: string; court?: string; url: string }> = [];
+  if (federalResult.status === "fulfilled" && federalResult.value.ok) {
+    const data = await federalResult.value.json() as { results?: Array<{ title?: string; publication_date?: string; html_url?: string; agencies?: Array<{ name?: string }> }> };
+    for (const document of data.results ?? []) if (document.title && document.html_url) notices.push({ title: document.title, date: document.publication_date, agency: document.agencies?.map((agency) => agency.name).filter(Boolean).join(", "), url: document.html_url });
+  }
+  if (courtResult.status === "fulfilled" && courtResult.value.ok) {
+    const data = await courtResult.value.json() as { results?: Array<{ caseName?: string; caseNameFull?: string; dateFiled?: string; court?: string; absolute_url?: string; cluster?: string }> };
+    for (const item of data.results ?? []) {
+      const path = item.absolute_url || item.cluster;
+      if (path) cases.push({ title: item.caseNameFull || item.caseName || "Public court result", date: item.dateFiled, court: item.court, url: path.startsWith("http") ? path : `https://www.courtlistener.com${path}` });
+    }
+  }
+  return jsonResponse({ available: true, jurisdiction: "United States - Federal Register and public court search", notices, cases, message: notices.length || cases.length ? "These are scoped research leads. Read the source and confirm relevance, current status, jurisdiction, and precedential effect with counsel." : "No matching public result was returned for this query. This is not proof that no law, permit, or case is relevant.", sources: ["Federal Register", "CourtListener public search"] }, 300);
+}
+
 async function findLocations(query: string): Promise<Response> {
   if (query.length < 2 || query.length > 140) return locationResponse([]);
   try {
@@ -172,6 +205,7 @@ const worker = {
     if (url.pathname === "/api/location-search") return secure(await findLocations(url.searchParams.get("q")?.trim() ?? ""));
     if (url.pathname === "/api/candidate-search") return secure(await findCandidateLeads(url));
     if (url.pathname === "/api/candidate-evidence") return secure(await candidateEvidence(url));
+    if (url.pathname === "/api/legal-research") return secure(await legalResearch(url));
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
       return secure(await handleImageOptimization(request, { fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))), transformImage: async (body, { width, format, quality }) => (await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality })).response() }, allowedWidths));
