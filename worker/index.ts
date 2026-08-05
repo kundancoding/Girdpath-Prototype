@@ -45,24 +45,18 @@ function distanceKm(a: Point, b: Point) {
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
   return 12742 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
-async function overpass(query: string): Promise<OsmElement[]> {
+async function overpass(query: string, timeoutMs?: number): Promise<OsmElement[]> {
   const endpoints = ["https://maps.mail.ru/osm/tools/overpass/api/interpreter", "https://overpass-api.de/api/interpreter"];
   let lastError = "Public map service did not respond.";
   for (const endpoint of endpoints) {
     try {
-      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "GridPath public-map screening" }, body: `data=${encodeURIComponent(query)}` });
+      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "GridPath public-map screening" }, body: `data=${encodeURIComponent(query)}`, ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}) });
       if (!response.ok) { lastError = `Public map service returned ${response.status}`; continue; }
       const data = await response.json() as { elements?: OsmElement[] };
       return Array.isArray(data.elements) ? data.elements : [];
     } catch { lastError = "Public map service could not be reached."; }
   }
   throw new Error(lastError);
-}
-function within<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Public map query timed out.")), milliseconds);
-    promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
-  });
 }
 function requestedScope(value: string | null): Scope { return value === "local" || value === "city" || value === "regional" || value === "state" || value === "country" ? value : "city"; }
 function useScore(tags: Record<string, string | undefined>, project: string) {
@@ -163,9 +157,9 @@ async function candidateEvidence(url: URL): Promise<Response> {
   const query = `[out:json][timeout:16];(nwr(around:5000,${point.lat},${point.lng})["power"="substation"];nwr(around:5000,${point.lat},${point.lng})["power"="plant"];nwr(around:5000,${point.lat},${point.lng})["power"="generator"];way(around:5000,${point.lat},${point.lng})["power"~"^(line|minor_line)$"];node(around:5000,${point.lat},${point.lng})["power"~"^(tower|pole)$"];way(around:5000,${point.lat},${point.lng})["highway"~"^(motorway|trunk|primary)$"];way(around:5000,${point.lat},${point.lng})["railway"~"^(rail|light_rail)$"];nwr(around:5000,${point.lat},${point.lng})["aeroway"~"^(aerodrome|helipad)$"];nwr(around:5000,${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland|construction|quarry)$"];nwr(around:5000,${point.lat},${point.lng})["building"];nwr(around:5000,${point.lat},${point.lng})["boundary"="protected_area"];nwr(around:5000,${point.lat},${point.lng})["leisure"="nature_reserve"];nwr(around:5000,${point.lat},${point.lng})["natural"~"^(wetland|water|wood)$"];nwr(around:5000,${point.lat},${point.lng})["landuse"="forest"];way(around:5000,${point.lat},${point.lng})["waterway"~"^(river|stream|canal)$"];);out center 400;`;
   const forecastUrl = `https://api.open-meteo.com/v1/forecast?latitude=${point.lat}&longitude=${point.lng}&timezone=auto&forecast_days=7&current=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,shortwave_radiation_sum,sunshine_duration,et0_fao_evapotranspiration`;
   const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${point.lat}&longitude=${point.lng}&current=us_aqi,pm2_5,pm10,nitrogen_dioxide,ozone,dust`;
-  // Map providers can be slow. Return the weather/air evidence package promptly rather
-  // than leaving all ranking, comparison, and shortlist sections blank.
-  const [mapResult, forecastResult, airResult] = await Promise.allSettled([within(overpass(query), 3500), fetch(forecastUrl), fetch(airUrl)]);
+  // Map providers can be slow. Abort each upstream request rather than leaving all
+  // ranking, comparison, and shortlist sections blank behind one stalled query.
+  const [mapResult, forecastResult, airResult] = await Promise.allSettled([overpass(query, 1800), fetch(forecastUrl), fetch(airUrl)]);
   if (mapResult.status !== "fulfilled" && forecastResult.status !== "fulfilled" && airResult.status !== "fulfilled") return jsonResponse({ error: "Public evidence is temporarily unavailable." }, 60);
   const elements = mapResult.status === "fulfilled" ? mapResult.value : [];
   const forecast = forecastResult.status === "fulfilled" && forecastResult.value.ok ? await forecastResult.value.json() as { elevation?: number; current?: Record<string, unknown>; daily?: Record<string, unknown> } : {};
