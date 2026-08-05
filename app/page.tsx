@@ -56,7 +56,7 @@ export default function Home() {
     let active = true; const controller = new AbortController(); setMappedLeads([]); setLeadStatus(`Finding actual mapped ${projectType.toLowerCase()} leads for the ${scopeConfig.label}.`);
     const timer = window.setTimeout(async () => {
       try {
-        const response = await fetch(`/api/candidate-search?lat=${coordinates.lat}&lng=${coordinates.lng}&scope=${scope}&project=${encodeURIComponent(projectType)}`, { signal: controller.signal });
+        const response = await fetch(`/api/candidate-search?lat=${coordinates.lat}&lng=${coordinates.lng}&scope=${scope}&project=${encodeURIComponent(projectType)}&location=${encodeURIComponent(locationName)}`, { signal: controller.signal });
         const data = await response.json() as { candidates?: CandidatePoint[]; source?: string; cappedRadiusM?: number; message?: string };
         if (!active) return;
         const leads = Array.isArray(data.candidates) ? data.candidates.filter((lead) => Number.isFinite(lead.lat) && Number.isFinite(lead.lng) && Boolean(lead.id)) : [];
@@ -65,7 +65,7 @@ export default function Home() {
       } catch (error) { if (active && !(error instanceof DOMException && error.name === "AbortError")) setLeadStatus("Mapped discovery is unavailable. No fake locations are substituted."); }
     }, 220);
     return () => { active = false; controller.abort(); window.clearTimeout(timer); };
-  }, [areaPoints.length, coordinates.lat, coordinates.lng, discoveryRetry, projectType, scope, scopeConfig.label]);
+  }, [areaPoints.length, coordinates.lat, coordinates.lng, discoveryRetry, locationName, projectType, scope, scopeConfig.label]);
 
   useEffect(() => { if (!candidatePoints.some((point) => point.id === activeId)) setActiveId(candidatePoints[0]?.id || ""); if (!candidatePoints.some((point) => point.id === compareId) || compareId === activeId) setCompareId(candidatePoints.find((point) => point.id !== activeId)?.id || ""); }, [activeId, candidatePoints, compareId]);
 

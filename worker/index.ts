@@ -71,22 +71,44 @@ function useScore(tags: Record<string, string | undefined>, project: string) {
   return score;
 }
 
+type MappedCandidate = { id: string; lat: number; lng: number; name: string; landUse: string; source: "mapped"; distance: number; score: number };
+
+async function photonCandidateLeads(point: Point, radius: number, project: string, locationHint: string): Promise<MappedCandidate[]> {
+  const place = locationHint.trim() || "local";
+  const projectWords = project.replace(/[^a-z0-9 ]/gi, " ").trim();
+  const queries = [...new Set([`${place} ${projectWords}`, `${place} substation`, `${place} industrial`, `${place} commercial`])].slice(0, 4);
+  const responses = await Promise.allSettled(queries.map((query) => fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&lat=${point.lat}&lon=${point.lng}&limit=10`)));
+  const seen = new Set<string>(); const pool: MappedCandidate[] = [];
+  for (const response of responses) {
+    if (response.status !== "fulfilled" || !response.value.ok) continue;
+    const data = await response.value.json() as { features?: Array<{ geometry?: { coordinates?: unknown[] }; properties?: Record<string, unknown> }> };
+    for (const feature of data.features ?? []) {
+      const coordinates = feature.geometry?.coordinates ?? []; const lng = Number(coordinates[0]); const lat = Number(coordinates[1]); const properties = feature.properties ?? {};
+      const name = String(properties.name || properties.street || properties.city || "Mapped OSM feature"); const osmType = String(properties.osm_value || properties.type || "named feature");
+      const distance = distanceKm(point, { lat, lng }); const id = `${properties.osm_type || "feature"}-${properties.osm_id || `${lat.toFixed(6)}-${lng.toFixed(6)}`}`;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || distance < .15 || distance > radius / 1000 || seen.has(id)) continue;
+      seen.add(id); const tags: Record<string, string | undefined> = { landuse: osmType };
+      if (/substation|power|generator/i.test(`${name} ${osmType}`)) tags.power = "substation";
+      pool.push({ id: `photon-${id}`, lat, lng, name, landUse: `OSM ${osmType}`, source: "mapped", distance, score: useScore(tags, project) });
+    }
+  }
+  return pool.sort((a, b) => b.score - a.score || a.distance - b.distance);
+}
+
 async function findCandidateLeads(url: URL): Promise<Response> {
   const point = parsePoint(url);
   const scope = requestedScope(url.searchParams.get("scope"));
   const project = (url.searchParams.get("project") || "").slice(0, 80);
+  const locationHint = (url.searchParams.get("location") || "").slice(0, 100);
   if (!point) return jsonResponse({ candidates: [], message: "A valid latitude and longitude are required." }, 60);
   try {
     const radius = scopeRadii[scope];
     const query = `[out:json][timeout:18];(way(around:${radius},${point.lat},${point.lng})["landuse"~"^(industrial|brownfield|commercial|farmland|construction|quarry)$"];nwr(around:${radius},${point.lat},${point.lng})["power"~"^(substation|plant|generator)$"];);out center 160;`;
-    let elements = await overpass(query);
+    let elements: OsmElement[] = [];
     // Some regions have little parcel tagging. A named OSM locality is still a real,
     // clickable geographic lead; use it only when there are no mapped land/power features.
     let localityFallback = false;
-    if (!elements.length) {
-      localityFallback = true;
-      elements = await overpass(`[out:json][timeout:18];nwr(around:${radius},${point.lat},${point.lng})["place"~"^(city|town|village|suburb)$"];out center 100;`);
-    }
+    try { elements = await overpass(query); if (!elements.length) { localityFallback = true; elements = await overpass(`[out:json][timeout:18];nwr(around:${radius},${point.lat},${point.lng})["place"~"^(city|town|village|suburb)$"];out center 100;`); } } catch { elements = []; }
     const pool = elements.flatMap((element) => {
       const center = pointFrom(element); const tags = element.tags ?? {};
       const isLocality = localityFallback && Boolean(tags.place);
@@ -104,7 +126,12 @@ async function findCandidateLeads(url: URL): Promise<Response> {
       candidates.push({ id: candidate.id, lat: candidate.lat, lng: candidate.lng, name: candidate.name, landUse: candidate.landUse, source: candidate.source });
       if (candidates.length === 12) break;
     }
-    return jsonResponse({ candidates, source: localityFallback ? "OpenStreetMap named locality fallback (no mapped land/power lead was available)" : "OpenStreetMap mapped land-use and power leads", cappedRadiusM: radius, message: candidates.length ? undefined : "The public map query completed but did not return a usable mapped feature for this area." }, 300);
+    if (!candidates.length) {
+      const photonLeads = await photonCandidateLeads(point, radius, project, locationHint);
+      const nearby = photonLeads.slice(0, 12).map(({ distance: _distance, score: _score, ...candidate }) => candidate);
+      return jsonResponse({ candidates: nearby, source: nearby.length ? "OpenStreetMap Photon matched features (Overpass was unavailable)" : "Public OpenStreetMap discovery", cappedRadiusM: radius, message: nearby.length ? undefined : "Neither public map provider returned a usable local feature for this area." }, 300);
+    }
+    return jsonResponse({ candidates, source: localityFallback ? "OpenStreetMap named locality fallback (no mapped land/power lead was available)" : "OpenStreetMap mapped land-use and power leads", cappedRadiusM: radius }, 300);
   } catch {
     return jsonResponse({ candidates: [], message: "Mapped-area discovery is temporarily unavailable." }, 60);
   }
