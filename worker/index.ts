@@ -3,7 +3,7 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 
 const securityHeaders = {
-  "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https://*.tile.openstreetmap.org https://*.arcgisonline.com; connect-src 'self' https://api.open-meteo.com https://air-quality-api.open-meteo.com https://geocoding-api.open-meteo.com https://api.bigdatacloud.net https://www.federalregister.gov https://overpass-api.de https://photon.komoot.io; frame-src https://www.openstreetmap.org; upgrade-insecure-requests",
+  "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https://*.tile.openstreetmap.org https://*.arcgisonline.com; connect-src 'self' https://api.open-meteo.com https://air-quality-api.open-meteo.com https://geocoding-api.open-meteo.com https://api.bigdatacloud.net https://www.federalregister.gov https://overpass-api.de https://maps.mail.ru https://photon.komoot.io; frame-src https://www.openstreetmap.org; upgrade-insecure-requests",
   "Permissions-Policy": "geolocation=(self), camera=(), microphone=(), payment=(), usb=()",
   "Referrer-Policy": "strict-origin-when-cross-origin",
   "X-Content-Type-Options": "nosniff",
@@ -46,10 +46,17 @@ function distanceKm(a: Point, b: Point) {
   return 12742 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 async function overpass(query: string): Promise<OsmElement[]> {
-  const response = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
-  if (!response.ok) throw new Error(`Public map service returned ${response.status}`);
-  const data = await response.json() as { elements?: OsmElement[] };
-  return Array.isArray(data.elements) ? data.elements : [];
+  const endpoints = ["https://maps.mail.ru/osm/tools/overpass/api/interpreter", "https://overpass-api.de/api/interpreter"];
+  let lastError = "Public map service did not respond.";
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "GridPath public-map screening" }, body: `data=${encodeURIComponent(query)}` });
+      if (!response.ok) { lastError = `Public map service returned ${response.status}`; continue; }
+      const data = await response.json() as { elements?: OsmElement[] };
+      return Array.isArray(data.elements) ? data.elements : [];
+    } catch { lastError = "Public map service could not be reached."; }
+  }
+  throw new Error(lastError);
 }
 function requestedScope(value: string | null): Scope { return value === "local" || value === "city" || value === "regional" || value === "state" || value === "country" ? value : "city"; }
 function useScore(tags: Record<string, string | undefined>, project: string) {
